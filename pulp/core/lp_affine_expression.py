@@ -37,6 +37,37 @@ class LpAffineExpression:
 
     def __init__(self, _expr: _rustcore.AffineExpr) -> None:
         self._expr: _rustcore.AffineExpr = _expr
+        self._stored_constraints: list[_rustcore.Constraint] = []
+
+    def _active_expr(
+        self, override_constant: float | None = None
+    ) -> _rustcore.AffineExpr:
+        """Read the current row, using a detached copy for formatting overrides."""
+        expr = (
+            self._stored_constraints[0].to_expr()
+            if self._stored_constraints
+            else self._expr
+        )
+        if override_constant is not None:
+            if not self._stored_constraints:
+                expr = expr.clone_expr()
+            expr.set_constant(override_constant)
+        return expr
+
+    def _begin_mutation(self) -> None:
+        self._expr = self._active_expr()
+
+    def _finish_mutation(self) -> None:
+        for constraint in self._stored_constraints:
+            constraint.replace_expr(self._expr)
+
+    def _check_variable_model(self, variable: LpVariable) -> None:
+        if (
+            self._stored_constraints
+            and self._stored_constraints[0].model_identity()
+            != variable._var.model_identity()
+        ):
+            raise ValueError("Variable belongs to a different model")
 
     # -- Factory class methods --
 
@@ -98,61 +129,71 @@ class LpAffineExpression:
 
     @property
     def name(self) -> str | None:
-        return self._expr.name
+        return self._active_expr().name
 
     @name.setter
     def name(self, value: str | None):
+        self._begin_mutation()
         if value:
             self._expr.set_name(str(value).translate(self.trans))
         else:
             self._expr.clear_name()
+        if self._stored_constraints:
+            self._stored_constraints[0].replace_expr(self._expr, replace_name=True)
 
     @property
     def constant(self) -> float:
-        return self._expr.constant
+        return self._active_expr().constant
 
     @constant.setter
     def constant(self, value: float):
+        self._begin_mutation()
         self._expr.set_constant(float(value))
+        self._finish_mutation()
 
     @property
     def sense(self) -> int | None:
-        rs = self._expr.sense
+        rs = self._active_expr().sense
         if rs is None:
             return None
         return _rust_sense_to_const(rs)
 
     @sense.setter
     def sense(self, value: int | None):
+        self._begin_mutation()
         if value is None:
             self._expr.clear_sense()
         else:
             self._expr.set_sense(_const_to_rust_sense(value))
+        self._finish_mutation()
 
     def items(self) -> list[tuple[LpVariable, float]]:
-        raw = self._expr.items()
+        raw = self._active_expr().items()
         return [(LpVariable(v), float(c)) for v, c in raw]
 
     def keys(self) -> list[LpVariable]:
-        return [LpVariable(v) for v in self._expr.keys()]
+        return [LpVariable(v) for v in self._active_expr().keys()]
 
     def values(self) -> list[float]:
-        return list(self._expr.values())
+        return list(self._active_expr().values())
 
     def __iter__(self) -> Iterator[LpVariable]:
         return iter(self.keys())
 
     def __len__(self) -> int:
-        return self._expr.num_terms()
+        return self._active_expr().num_terms()
 
     def __getitem__(self, key: LpVariable) -> float:
-        return self._expr.get_coeff(key._var)
+        return self._active_expr().get_coeff(key._var)
 
     def __setitem__(self, key: LpVariable, value: float | int):
         if not isinstance(key, LpVariable):
             raise TypeError("Only LpVariable keys supported")
+        self._check_variable_model(key)
+        self._begin_mutation()
         old = self._expr.get_coeff(key._var)
         self._expr.add_term(key._var, float(value) - old)
+        self._finish_mutation()
 
     def __contains__(self, key: LpVariable) -> bool:
         return key in self.keys()
@@ -176,13 +217,16 @@ class LpAffineExpression:
         return (float(self.constant) != 0.0) or (len(self) > 0)
 
     def value(self) -> float | None:
-        return self._expr.value()
+        return self._active_expr().value()
 
     def valueOrDefault(self) -> float:
-        return self._expr.value_or_default()
+        return self._active_expr().value_or_default()
 
     def addterm(self, key: LpVariable, value: float | int):
+        self._check_variable_model(key)
+        self._begin_mutation()
         self._expr.add_term(key._var, float(value))
+        self._finish_mutation()
 
     def emptyCopy(self) -> LpAffineExpression:
         e = LpAffineExpression.empty()
@@ -191,7 +235,7 @@ class LpAffineExpression:
         return e
 
     def copy(self) -> LpAffineExpression:
-        return LpAffineExpression(self._expr.clone_expr())
+        return LpAffineExpression(self._active_expr().clone_expr())
 
     @staticmethod
     def _str_coeff(c: float) -> str:
@@ -206,13 +250,7 @@ class LpAffineExpression:
     def _str_expr(
         self, include_constant: bool = True, override_constant: float | None = None
     ) -> str:
-        if override_constant is not None:
-            saved = self.constant
-            self.constant = override_constant
-            result = self._expr.str_expr(include_constant)
-            self.constant = saved
-            return result
-        return self._expr.str_expr(include_constant)
+        return self._active_expr(override_constant).str_expr(include_constant)
 
     def __str__(
         self, include_constant: bool = True, override_constant: float | None = None
@@ -225,20 +263,14 @@ class LpAffineExpression:
         return self._str_expr(include_constant, override_constant)
 
     def __repr__(self, override_constant: float | None = None) -> str:
-        if override_constant is not None:
-            saved = self.constant
-            self.constant = override_constant
-            result = self._expr.repr_expr()
-            self.constant = saved
-            return result
-        return self._expr.repr_expr()
+        return self._active_expr(override_constant).repr_expr()
 
     @staticmethod
     def _count_characters(line: list[str]) -> int:
         return sum(len(t) for t in line)
 
     def asCplexVariablesOnly(self, name: str) -> tuple[list[str], list[str]]:
-        return self._expr.as_cplex_variables_only(name)
+        return self._active_expr().as_cplex_variables_only(name)
 
     def asCplexLpAffineExpression(
         self,
@@ -246,16 +278,12 @@ class LpAffineExpression:
         include_constant: bool = True,
         override_constant: float | None = None,
     ) -> str:
-        if override_constant is not None:
-            saved = self.constant
-            self.constant = override_constant
-            result = self._expr.as_cplex_lp_affine_expression(name, include_constant)
-            self.constant = saved
-            return result
-        return self._expr.as_cplex_lp_affine_expression(name, include_constant)
+        return self._active_expr(override_constant).as_cplex_lp_affine_expression(
+            name, include_constant
+        )
 
     def asCplexLpConstraint(self, name: str) -> str:
-        return self._expr.as_cplex_lp_constraint(name)
+        return self._active_expr().as_cplex_lp_constraint(name)
 
     def addInPlace(
         self,
@@ -273,8 +301,11 @@ class LpAffineExpression:
         if isinstance(other, LpVariable):
             self.addterm(other, sign)
         elif isinstance(other, LpAffineExpression):
-            self._expr.add_expr(other._expr, sign)
-            self._expr.combine_sense(other._expr.sense, float(sign))
+            self._begin_mutation()
+            other_expr = other._active_expr()
+            self._expr.add_expr(other_expr, sign)
+            self._expr.combine_sense(other_expr.sense, float(sign))
+            self._finish_mutation()
         elif isinstance(other, dict):
             for e in other.values():
                 self.addInPlace(cast(Any, e), sign=sign)
@@ -284,9 +315,7 @@ class LpAffineExpression:
         elif _is_numeric_scalar(other):
             if not _is_finite_numeric(other):
                 raise const.PulpError("Cannot add/subtract NaN/inf values")
-            self._expr.set_constant(
-                self._expr.constant + _numeric_to_float(other) * sign
-            )
+            self.constant += _numeric_to_float(other) * sign
         else:
             raise TypeError(
                 f"Unsupported type for in-place add/subtract: {type(other).__name__}"
@@ -305,7 +334,7 @@ class LpAffineExpression:
         return self.addInPlace(other, sign=-1)
 
     def __neg__(self) -> LpAffineExpression:
-        e = LpAffineExpression(self._expr.clone_expr())
+        e = self.copy()
         e._expr.scale(-1.0)
         return e
 
@@ -351,10 +380,10 @@ class LpAffineExpression:
             if len(other):
                 if len(self):
                     raise TypeError("Non-constant expressions cannot be multiplied")
-                e._expr = other._expr.clone_expr()
+                e._expr = other._active_expr().clone_expr()
                 e._expr.scale(self.constant)
             else:
-                e._expr = self._expr.clone_expr()
+                e._expr = self._active_expr().clone_expr()
                 e._expr.scale(other.constant)
         elif isinstance(other, LpVariable):
             return self * LpAffineExpression.from_variable(other)
@@ -362,7 +391,7 @@ class LpAffineExpression:
             if not _is_finite_numeric(other):
                 raise const.PulpError("Cannot multiply variables with NaN/inf values")
             if other != 0:
-                e._expr = self._expr.clone_expr()
+                e._expr = self._active_expr().clone_expr()
                 e._expr.scale(_numeric_to_float(other))
         return e
 
@@ -386,7 +415,7 @@ class LpAffineExpression:
             other = other.constant
         if not _is_finite_numeric(other):
             raise const.PulpError("Cannot divide variables with NaN/inf values")
-        e = LpAffineExpression(self._expr.clone_expr())
+        e = self.copy()
         e._expr.scale(1.0 / _numeric_to_float(other))
         return e
 
